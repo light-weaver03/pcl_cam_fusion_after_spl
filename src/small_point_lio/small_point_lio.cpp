@@ -56,8 +56,25 @@ namespace small_point_lio {
                     for (const auto &imu_msg: preprocess.imu_deque) {
                         estimator.kf.x.gravity += imu_msg.linear_acceleration.cast<state::value_type>();
                     }
+                    RCLCPP_INFO(rclcpp::get_logger("small_point_lio"), "Estimated gravity before norm: [%f, %f, %f]", estimator.kf.x.gravity(0), estimator.kf.x.gravity(1), estimator.kf.x.gravity(2));
                     state::value_type scale = -static_cast<state::value_type>(parameters.gravity.norm()) / estimator.kf.x.gravity.norm();
                     estimator.kf.x.gravity *= scale;
+                    RCLCPP_INFO(rclcpp::get_logger("small_point_lio"), "Gravity estimated (before correction): [%f, %f, %f]", estimator.kf.x.gravity(0), estimator.kf.x.gravity(1), estimator.kf.x.gravity(2));
+                    
+                    //修正gravity与rotation
+                    Eigen::Vector3d gravity_estimated = estimator.kf.x.gravity.normalized();
+                    Eigen::Vector3d gravity_target = parameters.gravity.normalized();
+
+                    //计算旋转四元数
+                    Eigen::Quaterniond q_correction = Eigen::Quaterniond::FromTwoVectors(gravity_estimated, gravity_target);
+                    //修正rotation
+                    estimator.kf.x.rotation = (q_correction * Eigen::Quaterniond(estimator.kf.x.rotation)).normalized().toRotationMatrix();
+                    //修正gravity
+                    estimator.kf.x.gravity = q_correction * estimator.kf.x.gravity;
+
+                    
+                    RCLCPP_INFO(rclcpp::get_logger("small_point_lio"), "Gravity corrected to: [%f, %f, %f]", estimator.kf.x.gravity(0), estimator.kf.x.gravity(1), estimator.kf.x.gravity(2));
+                    RCLCPP_INFO(rclcpp::get_logger("small_point_lio"), "Initial rotation corrected for IMU tilt.");
                 } else {
                     estimator.kf.x.gravity = parameters.gravity.cast<state::value_type>();
                 }
