@@ -47,6 +47,17 @@ namespace small_point_lio {
         tf2::Transform tf_base_link_to_lidar_;  // TF 广播用
         rclcpp::TimerBase::SharedPtr extrinsic_init_timer_;  // 外参初始化定时器
 
+        // 重力对齐：将lidar_odom系旋转至Z轴竖直向上的odom系
+        bool gravity_alignment_enabled_{false};  // 是否启用重力对齐
+        bool gravity_alignment_done_{false};     // 重力对齐是否已完成
+        bool gravity_alignment_debug_{false};    // 是否输出调试信息
+        Eigen::Quaternionf q_gravity_align_{Eigen::Quaternionf::Identity()};  // lidar_odom → odom 的纯旋转
+        std::vector<Eigen::Vector3d> imu_accel_buffer_;  // 用于收集IMU加速度数据
+        static constexpr size_t GRAVITY_INIT_SAMPLES = 200;  // 用于初始化重力的IMU样本数
+
+        // 计算重力对齐变换
+        void computeGravityAlignment(const Eigen::Vector3d& measured_gravity);
+
     public:
         explicit SmallPointLioNode(const rclcpp::NodeOptions &options);
     };

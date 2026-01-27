@@ -7,6 +7,8 @@ small_point_lio:
         lidar_type: livox                          # 雷达类型
         lidar_frame: livox_frame                   # 雷达坐标系
         save_pcd: false                            # 是否保存点云
+        gravity_alignment: false                    # 是否启用重力对齐（让odom系Z轴严格竖直向上）
+        gravity_alignment_debug: false             # 是否输出重力对齐的调试信息（每100帧输出一次变换四元数）
 
         # 点云过滤
         point_filter_num: 1                        # 多少个点取一个点
@@ -16,7 +18,7 @@ small_point_lio:
         space_downsample_leaf_size: 0.2            # 点云降采样时使用的栅格大小
 
         # IMU处理
-        gravity: [0.0, 0.0, -9.810]                # 重力
+        gravity: [0.0, 0.0, -9.810]               # 重力向量（odom系下指向地心，负Z轴）
         fix_gravity_direction: true                # 是否收集前200个IMU数据修正重力方向，重力的大小依旧从gravity参数获得
         check_satu: true                           # 是否开启IMU的数据饱和检查
         satu_acc: 3.0                              # IMU的加速度饱和阈值

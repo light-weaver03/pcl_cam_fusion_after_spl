@@ -22,6 +22,20 @@ namespace small_point_lio {
         std::string lidar_type = declare_parameter<std::string>("lidar_type");
         std::string lidar_frame = declare_parameter<std::string>("lidar_frame");
         bool save_pcd = declare_parameter<bool>("save_pcd");
+        gravity_alignment_enabled_ = declare_parameter<bool>("gravity_alignment", true);
+        gravity_alignment_debug_ = declare_parameter<bool>("gravity_alignment_debug", false);
+        
+        RCLCPP_INFO(get_logger(), "Gravity alignment enabled: %s", gravity_alignment_enabled_ ? "true" : "false");
+        if (gravity_alignment_debug_) {
+            RCLCPP_INFO(get_logger(), "Gravity alignment debug output: enabled");
+        }
+        
+        // 如果不启用重力对齐，直接标记为完成（使用单位四元数）
+        if (!gravity_alignment_enabled_) {
+            gravity_alignment_done_ = true;
+            RCLCPP_INFO(get_logger(), "Gravity alignment disabled, using identity transform");
+        }
+        
         small_point_lio = std::make_unique<small_point_lio::SmallPointLio>(*this);
         odometry_publisher = create_publisher<nav_msgs::msg::Odometry>("/Odometry", 1000);
         pointcloud_publisher = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 1000);
@@ -119,6 +133,14 @@ namespace small_point_lio {
                     "Extrinsic not ready, skipping odometry callback");
                 return;
             }
+            
+            // 如果启用重力对齐但尚未完成，跳过发布
+            if (gravity_alignment_enabled_ && !gravity_alignment_done_) {
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+                    "Waiting for gravity alignment initialization...");
+                return;
+            }
+            
             last_odometry = odometry;
 
             builtin_interfaces::msg::Time time_msg;
@@ -130,15 +152,119 @@ namespace small_point_lio {
             transform_stamped.header.frame_id = "odom";
             transform_stamped.child_frame_id = "base_link";
 
-            // 使用缓存的外参进行相似变换
-            tf2::Transform tf_odom_to_lidar;
-            tf_odom_to_lidar.setOrigin(tf2::Vector3(odometry.position.x(), odometry.position.y(), odometry.position.z()));
-            tf_odom_to_lidar.setRotation(tf2::Quaternion(odometry.orientation.x(), odometry.orientation.y(), odometry.orientation.z(), odometry.orientation.w()));
-
-            // T_odom'→base_link = T_lidar→base_link * T_odom→lidar * T_base_link→lidar
-            tf2::Transform tf_lidar_to_base_link = tf_base_link_to_lidar_.inverse();
-            tf2::Transform tf_odom_to_base_link = tf_lidar_to_base_link * tf_odom_to_lidar * tf_base_link_to_lidar_;
-            transform_stamped.transform = tf2::toMsg(tf_odom_to_base_link);
+            // ============================================================
+            // 变换推导：
+            // 
+            // 两种模式：
+            // 
+            // 模式1：重力对齐启用 (gravity_alignment: true)
+            //   - LIO输出: T_lidar_odom→lidar (lidar在lidar_odom系下的位姿)
+            //   - 重力对齐: q_gravity_align (将lidar_odom系的Z轴旋转到指向天)
+            //   - odom = 重力对齐后的坐标系（Z轴竖直向上）
+            //   - 公式：q_base_in_odom = q_gravity_align * q_lidar_odom * q_base_to_lidar
+            //
+            // 模式2：重力对齐禁用 (gravity_alignment: false)
+            //   - odom = lidar_odom（直接使用LIO输出的坐标系）
+            //   - 需要应用相似变换将 lidar 位姿转换到 base_link
+            //   - 公式：T_odom→base = T_lidar→base * T_odom→lidar * T_base→lidar
+            //          (相似变换，考虑外参的旋转中心)
+            // ============================================================
+            
+            // LIO输出的位姿（lidar_odom → lidar）
+            Eigen::Vector3f pos_lidar_odom = odometry.position.cast<float>();
+            Eigen::Quaternionf q_lidar_odom(odometry.orientation.cast<float>());
+            
+            Eigen::Vector3f pos_base_in_odom;
+            Eigen::Quaternionf q_base_in_odom;
+            
+            if (gravity_alignment_enabled_) {
+                // ============================================================
+                // 模式1：重力对齐模式
+                // ============================================================
+                
+                // 外参的旋转部分：q_base_to_lidar（注意方向！）
+                // T_lidar_to_base_ 是 lidar → base，所以它的旋转的逆是 base → lidar
+                Eigen::Quaternionf q_lidar_to_base(T_lidar_to_base_.rotation());
+                Eigen::Quaternionf q_base_to_lidar = q_lidar_to_base.inverse();
+                
+                // Step 1: 计算 lidar 在水平 odom 系下的位姿
+                Eigen::Vector3f pos_lidar_in_odom = q_gravity_align_ * pos_lidar_odom;
+                Eigen::Quaternionf q_lidar_in_odom = q_gravity_align_ * q_lidar_odom;
+                
+                // Step 2: 计算 base_link 在 odom 系下的姿态
+                // q_base_in_odom = q_lidar_in_odom * q_base_to_lidar
+                q_base_in_odom = q_lidar_in_odom * q_base_to_lidar;
+                
+                // Step 3: 计算 base_link 的位置
+                // pos_base = pos_lidar + q_lidar * translation_lidar_to_base
+                Eigen::Vector3f translation_lidar_to_base = T_lidar_to_base_.translation();
+                pos_base_in_odom = pos_lidar_in_odom + q_lidar_in_odom * translation_lidar_to_base;
+                
+            } else {
+                // ============================================================
+                // 模式2：无重力对齐，使用相似变换
+                // ============================================================
+                
+                // 相似变换公式：T_new = T_lidar_to_base * T_old * T_base_to_lidar
+                // 
+                // 物理意义：把"lidar的运动"转换成"base_link的运动"
+                // - T_base_to_lidar: 先把世界坐标系变换到base_link的视角
+                // - T_old: lidar的运动
+                // - T_lidar_to_base: 再变换回世界坐标系，但现在描述的是base_link的运动
+                
+                // 构建 tf2::Transform 进行相似变换
+                tf2::Transform tf_lidar_odom_to_lidar;
+                tf_lidar_odom_to_lidar.setOrigin(tf2::Vector3(pos_lidar_odom.x(), pos_lidar_odom.y(), pos_lidar_odom.z()));
+                tf_lidar_odom_to_lidar.setRotation(tf2::Quaternion(q_lidar_odom.x(), q_lidar_odom.y(), q_lidar_odom.z(), q_lidar_odom.w()));
+                
+                // 外参变换（Eigen::Isometry3f 转换为 tf2::Transform）
+                tf2::Transform tf_lidar_to_base;
+                tf_lidar_to_base.setOrigin(tf2::Vector3(
+                    T_lidar_to_base_.translation().x(),
+                    T_lidar_to_base_.translation().y(),
+                    T_lidar_to_base_.translation().z()));
+                Eigen::Quaternionf q_lidar_to_base_eigen(T_lidar_to_base_.rotation());
+                tf_lidar_to_base.setRotation(tf2::Quaternion(
+                    q_lidar_to_base_eigen.x(),
+                    q_lidar_to_base_eigen.y(),
+                    q_lidar_to_base_eigen.z(),
+                    q_lidar_to_base_eigen.w()));
+                
+                tf2::Transform tf_base_to_lidar = tf_lidar_to_base.inverse();
+                
+                // 相似变换
+                tf2::Transform tf_odom_to_base = tf_lidar_to_base * tf_lidar_odom_to_lidar * tf_base_to_lidar;
+                
+                // 提取结果
+                auto origin = tf_odom_to_base.getOrigin();
+                pos_base_in_odom = Eigen::Vector3f(origin.x(), origin.y(), origin.z());
+                
+                auto rotation = tf_odom_to_base.getRotation();
+                q_base_in_odom = Eigen::Quaternionf(rotation.w(), rotation.x(), rotation.y(), rotation.z());
+            }
+            
+            tf2::Transform tf_odom_to_base_final;
+            tf_odom_to_base_final.setOrigin(tf2::Vector3(pos_base_in_odom.x(), pos_base_in_odom.y(), pos_base_in_odom.z()));
+            tf_odom_to_base_final.setRotation(tf2::Quaternion(q_base_in_odom.x(), q_base_in_odom.y(), q_base_in_odom.z(), q_base_in_odom.w()));
+            
+            // DEBUG: 输出各个变换的四元数（可通过 gravity_alignment_debug 参数控制）
+            if (gravity_alignment_debug_) {
+                static int debug_counter = 0;
+                if (debug_counter++ % 100 == 0) {
+                    RCLCPP_INFO(get_logger(), "DEBUG transforms (mode: %s):",
+                        gravity_alignment_enabled_ ? "gravity_aligned" : "similarity_transform");
+                    RCLCPP_INFO(get_logger(), "  q_lidar_odom (LIO output): [w=%.3f, x=%.3f, y=%.3f, z=%.3f]",
+                        q_lidar_odom.w(), q_lidar_odom.x(), q_lidar_odom.y(), q_lidar_odom.z());
+                    if (gravity_alignment_enabled_) {
+                        RCLCPP_INFO(get_logger(), "  q_gravity_align: [w=%.3f, x=%.3f, y=%.3f, z=%.3f]",
+                            q_gravity_align_.w(), q_gravity_align_.x(), q_gravity_align_.y(), q_gravity_align_.z());
+                    }
+                    RCLCPP_INFO(get_logger(), "  q_base_in_odom (final): [w=%.3f, x=%.3f, y=%.3f, z=%.3f]",
+                        q_base_in_odom.w(), q_base_in_odom.x(), q_base_in_odom.y(), q_base_in_odom.z());
+                }
+            }
+            
+            transform_stamped.transform = tf2::toMsg(tf_odom_to_base_final);
 
             nav_msgs::msg::Odometry odometry_msg;
             odometry_msg.header.stamp = time_msg;
@@ -152,14 +278,6 @@ namespace small_point_lio {
             odometry_msg.pose.pose.orientation.z = transform_stamped.transform.rotation.z;
             odometry_msg.pose.pose.orientation.w = transform_stamped.transform.rotation.w;
 
-            // TODO it is lidar_odom->lidar_frame, we need to transform it to odom->base_link
-            // odometry_msg.twist.twist.linear.x = odometry.velocity.x();
-            // odometry_msg.twist.twist.linear.y = odometry.velocity.y();
-            // odometry_msg.twist.twist.linear.z = odometry.velocity.z();
-            // odometry_msg.twist.twist.angular.x = odometry.angular_velocity.x();
-            // odometry_msg.twist.twist.angular.y = odometry.angular_velocity.y();
-            // odometry_msg.twist.twist.angular.z = odometry.angular_velocity.z();
-
             tf_broadcaster->sendTransform(transform_stamped);
             odometry_publisher->publish(odometry_msg);
         });
@@ -170,23 +288,60 @@ namespace small_point_lio {
                         "Extrinsic not ready, skipping pointcloud callback");
                     return;
                 }
+                
+                // 如果启用重力对齐但尚未完成，跳过发布
+                if (gravity_alignment_enabled_ && !gravity_alignment_done_) {
+                    return;
+                }
 
                 builtin_interfaces::msg::Time time_msg;
                 time_msg.sec = std::floor(last_odometry.timestamp);
                 time_msg.nanosec = static_cast<uint32_t>((last_odometry.timestamp - time_msg.sec) * 1e9);
 
-                // 使用缓存的 lidar → base_link 变换
+                // ============================================================
+                // 点云变换流程：
+                // 
+                // 模式1：重力对齐启用 (gravity_alignment: true)
+                //   - 原始点云在 lidar_odom 系下（LIO内部全局地图）
+                //   - 应用重力对齐旋转，变换到水平的 odom 系
+                //   - frame_id = "odom"（Z轴竖直向上的世界坐标系）
+                //
+                // 模式2：重力对齐禁用 (gravity_alignment: false)
+                //   - 原始点云在 lidar_odom 系下
+                //   - 应用相似变换，将点云转换到 base_link 为中心的 odom 系
+                //   - frame_id = "odom"（但实际是以 base_link 为参考的坐标系）
+                // ============================================================
+                
                 pcl::PointCloud<pcl::PointXYZI> pcl_pointcloud;
                 pcl_pointcloud.points.reserve(pointcloud.size());
-                for (const auto &point: pointcloud) {
-                    // 将点从 lidar-odom 系变换到 base_link-odom 系
-                    Eigen::Vector3f transformed_point = T_lidar_to_base_ * point;
-                    pcl::PointXYZI new_point;
-                    new_point.x = transformed_point.x();
-                    new_point.y = transformed_point.y();
-                    new_point.z = transformed_point.z();
-                    pcl_pointcloud.points.push_back(new_point);
+                
+                if (gravity_alignment_enabled_) {
+                    // 模式1：仅应用重力对齐旋转（点云是全局地图，只需要姿态对齐）
+                    for (const auto &point: pointcloud) {
+                        Eigen::Vector3f aligned_point = q_gravity_align_ * point;
+                        pcl::PointXYZI new_point;
+                        new_point.x = aligned_point.x();
+                        new_point.y = aligned_point.y();
+                        new_point.z = aligned_point.z();
+                        pcl_pointcloud.points.push_back(new_point);
+                    }
+                } else {
+                    // 模式2：应用相似变换
+                    // 将点云从 lidar_odom 系转换到以 base_link 为参考的 odom 系
+                    
+                    // 对于全局点云地图，我们只需要应用静态的外参变换
+                    // 把地图从"以初始 lidar 为原点"变换到"以初始 base_link 为原点"
+                    for (const auto &point_in_lidar_odom: pointcloud) {
+                        Eigen::Vector3f point_transformed = T_lidar_to_base_ * point_in_lidar_odom;
+                        
+                        pcl::PointXYZI new_point;
+                        new_point.x = point_transformed.x();
+                        new_point.y = point_transformed.y();
+                        new_point.z = point_transformed.z();
+                        pcl_pointcloud.points.push_back(new_point);
+                    }
                 }
+                
                 pcl_pointcloud.width = pcl_pointcloud.points.size();
                 pcl_pointcloud.height = 1;
                 pcl_pointcloud.is_dense = true;
@@ -227,9 +382,61 @@ namespace small_point_lio {
                     imu_msg.angular_velocity = Eigen::Vector3d(msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z);
                     imu_msg.linear_acceleration = Eigen::Vector3d(msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z);
                     imu_msg.timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9;
+                    
+                    // 收集IMU数据用于重力对齐初始化
+                    if (gravity_alignment_enabled_ && !gravity_alignment_done_) {
+                        imu_accel_buffer_.push_back(imu_msg.linear_acceleration);
+                        if (imu_accel_buffer_.size() % 50 == 0) {
+                            RCLCPP_INFO(get_logger(), "Collecting IMU data for gravity alignment: %zu/%zu",
+                                imu_accel_buffer_.size(), GRAVITY_INIT_SAMPLES);
+                        }
+                        if (imu_accel_buffer_.size() >= GRAVITY_INIT_SAMPLES) {
+                            // 计算平均加速度
+                            Eigen::Vector3d avg_accel = Eigen::Vector3d::Zero();
+                            for (const auto& accel : imu_accel_buffer_) {
+                                avg_accel += accel;
+                            }
+                            avg_accel /= static_cast<double>(imu_accel_buffer_.size());
+                            computeGravityAlignment(avg_accel);
+                            imu_accel_buffer_.clear();
+                        }
+                    }
+                    
                     small_point_lio->on_imu_callback(imu_msg);
                     small_point_lio->handle_once();
                 });
+    }
+
+    void SmallPointLioNode::computeGravityAlignment(const Eigen::Vector3d& measured_gravity) {
+        // measured_gravity 是IMU测量的加速度（静止时指向上方，约[0,0,9.81]或根据IMU安装而不同）
+        // 
+        // LIO的lidar_odom系定义：以第一帧IMU的姿态为原点，Z轴方向由IMU测量决定
+        // 如果IMU测到的加速度是 [ax, ay, az]（归一化后），这就是lidar_odom系的"上"方向
+        //
+        // 我们想要odom系的Z轴严格向上，所以需要计算一个旋转：
+        // R_align * gravity_dir_in_lidar_odom = [0, 0, 1]_in_odom
+        //
+        // 这个 R_align 应用到 lidar_odom 系下的所有向量，就能得到 odom 系下的表示
+        
+        Eigen::Vector3d gravity_dir = measured_gravity.normalized();  // lidar_odom系中"上"的方向
+        Eigen::Vector3d target_up(0.0, 0.0, 1.0);  // odom系中"上"的方向
+        
+        // FromTwoVectors(a, b) 返回将 a 旋转到 b 的四元数
+        Eigen::Quaterniond q_align = Eigen::Quaterniond::FromTwoVectors(gravity_dir, target_up);
+        q_gravity_align_ = q_align.cast<float>();
+        
+        gravity_alignment_done_ = true;
+        
+        RCLCPP_INFO(get_logger(), "Gravity alignment computed:");
+        RCLCPP_INFO(get_logger(), "  Measured 'up' direction in lidar_odom: [%.4f, %.4f, %.4f]",
+            gravity_dir.x(), gravity_dir.y(), gravity_dir.z());
+        RCLCPP_INFO(get_logger(), "  Alignment quaternion (lidar_odom → odom): [w=%.4f, x=%.4f, y=%.4f, z=%.4f]",
+            q_gravity_align_.w(), q_gravity_align_.x(), q_gravity_align_.y(), q_gravity_align_.z());
+        
+        // 验证：对齐后的"上"方向应该是 [0, 0, 1]
+        Eigen::Vector3f aligned_up = q_gravity_align_ * gravity_dir.cast<float>();
+        RCLCPP_INFO(get_logger(), "  Aligned 'up' direction in odom: [%.4f, %.4f, %.4f]",
+            aligned_up.x(), aligned_up.y(), aligned_up.z());
     }
 
 }// namespace small_point_lio
