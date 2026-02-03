@@ -54,6 +54,9 @@ find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(livox_ros_driver2 QUIET)
+find_package(OpenCV REQUIRED)
+find_package(tf2_sensor_msgs REQUIRED)
+
 if(OPENMP_FOUND)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
@@ -73,12 +76,17 @@ configure_file(include/param_deliver.h.in include/param_deliver.h @ONLY)
 
 file(GLOB_RECURSE SOURCE include/*.h src/*.cpp)
 
+# 把带 main() 的节点从库源文件里排除
+list(FILTER SOURCE EXCLUDE REGEX ".*/picture_filter\\.cpp$")
+list(FILTER SOURCE EXCLUDE REGEX ".*/cloud_to_lidar_colorize\\.cpp$")
+
 ament_auto_add_library(${PROJECT_NAME} SHARED ${SOURCE})
 target_precompile_headers(${PROJECT_NAME} PRIVATE include/small_point_lio/pch.h)
 target_include_directories(${PROJECT_NAME} PUBLIC
     include
     ${CMAKE_CURRENT_BINARY_DIR}/include
 )
+
 target_link_libraries(${PROJECT_NAME}
     Eigen3::Eigen
     ${PCL_LIBRARIES}
@@ -104,6 +112,36 @@ rclcpp_components_register_node(${PROJECT_NAME}
     PLUGIN small_point_lio::SmallPointLioNode
     EXECUTABLE ${PROJECT_NAME}_node
 )
+#增加两个可执行节点
+# ============ picture_filter executable ============
+add_executable(picture_filter_node src/picture_filter.cpp)
+ament_target_dependencies(picture_filter_node
+  rclcpp
+  sensor_msgs
+)
+install(TARGETS picture_filter_node DESTINATION lib/${PROJECT_NAME})
+
+# ============ cloud_to_lidar_colorize executable ============
+add_executable(cloud_to_lidar_colorize_node src/cloud_to_lidar_colorize.cpp)
+target_include_directories(cloud_to_lidar_colorize_node PRIVATE ${OpenCV_INCLUDE_DIRS})
+
+# 链接本包库（可选，但通常建议，这样能复用 include / 依赖）
+target_link_libraries(cloud_to_lidar_colorize_node
+  ${PROJECT_NAME}
+  ${PCL_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+)
+
+ament_target_dependencies(cloud_to_lidar_colorize_node
+  rclcpp
+  sensor_msgs
+  geometry_msgs
+  tf2_ros
+  tf2_sensor_msgs
+  pcl_conversions
+)
+
+install(TARGETS cloud_to_lidar_colorize_node DESTINATION lib/${PROJECT_NAME})
 
 #############
 ## Testing ##

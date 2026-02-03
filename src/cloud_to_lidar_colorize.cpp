@@ -1,0 +1,422 @@
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/image.hpp>
+
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
+
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/common/io.h>
+
+#include <opencv2/opencv.hpp>
+
+#include <deque>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <limits>
+#include <cmath>
+#include <regex>
+#include <array>
+
+
+class CloudToLidarNode : public rclcpp::Node {
+public:
+  CloudToLidarNode()
+  : Node("cloud_to_lidar_node"),
+    tf_buffer_(this->get_clock()),
+    tf_listener_(tf_buffer_) {
+
+    // ---------------- params ----------------
+    declare_parameter<std::string>("cloud_topic", "/cloud_registered");
+    declare_parameter<std::string>("image_topic", "/image_nearest");   // picture_filter 输出
+    declare_parameter<std::string>("lidar_frame", "livox_frame");      // 与 TF 一致
+    declare_parameter<std::string>("calib_file", "single_calib_result.txt");
+
+    // 相机内参（你之前长焦那套）
+    declare_parameter<double>("fx", 13800.0);
+    declare_parameter<double>("fy", 13800.0);
+    declare_parameter<double>("cx", 743.785);
+    declare_parameter<double>("cy", 566.278);
+
+    // 畸变（默认清零；你也可以改成读文件）
+    declare_parameter<double>("k1", 0.0);
+    declare_parameter<double>("k2", 0.0);
+    declare_parameter<double>("p1", 0.0);
+    declare_parameter<double>("p2", 0.0);
+
+    // TF lookup 超时
+    declare_parameter<double>("tf_timeout", 0.2);
+
+    // 插值模式：bilinear双线性，效率和平滑并重
+    declare_parameter<std::string>("interp", "bilinear");
+
+    cloud_topic_ = get_parameter("cloud_topic").as_string();
+    image_topic_ = get_parameter("image_topic").as_string();
+    lidar_frame_ = get_parameter("lidar_frame").as_string();
+    calib_file_  = get_parameter("calib_file").as_string();
+
+    fx_ = get_parameter("fx").as_double();
+    fy_ = get_parameter("fy").as_double();
+    cx_ = get_parameter("cx").as_double();
+    cy_ = get_parameter("cy").as_double();
+    k1_ = get_parameter("k1").as_double();
+    k2_ = get_parameter("k2").as_double();
+    p1_ = get_parameter("p1").as_double();
+    p2_ = get_parameter("p2").as_double();
+    tf_timeout_s_ = get_parameter("tf_timeout").as_double();
+    interp_ = get_parameter("interp").as_string();
+
+    // ---------------- load extrinsic ----------------
+    if (!loadExtrinsic(calib_file_)) {
+      RCLCPP_ERROR(get_logger(), "Failed to load extrinsic from: %s", calib_file_.c_str());
+      // 不中断运行：用默认标定值（你给的那组）
+      setDefaultExtrinsic();
+      RCLCPP_WARN(get_logger(), "Use default extrinsic hardcoded.");
+    }
+
+    // ---------------- subscribers/publishers ----------------
+    sub_cloud_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+      cloud_topic_, rclcpp::SensorDataQoS(),
+      std::bind(&CloudToLidarNode::onCloud, this, std::placeholders::_1));
+
+    sub_img_ = create_subscription<sensor_msgs::msg::Image>(
+      image_topic_, rclcpp::SensorDataQoS(),
+      std::bind(&CloudToLidarNode::onImage, this, std::placeholders::_1));
+
+    pub_colored_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_colored", rclcpp::SensorDataQoS());
+
+    RCLCPP_INFO(get_logger(),
+      "Sub cloud: %s, Sub image: %s, lidar_frame=%s, calib=%s, interp=%s",
+      cloud_topic_.c_str(), image_topic_.c_str(), lidar_frame_.c_str(),
+      calib_file_.c_str(), interp_.c_str());
+  }
+
+private:
+  // ============== image cache ==============
+  // picture_filter 已经把 image 降到 10Hz 左右，并尽量对齐 cloud stamp；
+  // 这里仍做一个“最近一张”缓存，防止偶发乱序。
+  struct ImageItem {
+    rclcpp::Time stamp;
+    sensor_msgs::msg::Image::SharedPtr msg;
+  };
+  std::deque<ImageItem> img_buf_;
+  const size_t IMG_BUF_MAX_ = 20;
+
+  void onImage(const sensor_msgs::msg::Image::SharedPtr msg) {
+    img_buf_.push_back({rclcpp::Time(msg->header.stamp), msg});
+    while (img_buf_.size() > IMG_BUF_MAX_) img_buf_.pop_front();
+  }
+
+  sensor_msgs::msg::Image::SharedPtr getNearestImage(const rclcpp::Time& t, double max_dt_s) {
+    if (img_buf_.empty()) return nullptr;
+    size_t best = 0;
+    double best_dt = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < img_buf_.size(); ++i) {
+      double dt = std::abs((img_buf_[i].stamp - t).seconds());
+      if (dt < best_dt) { best_dt = dt; best = i; }
+    }
+    if (best_dt > max_dt_s) return nullptr;
+    return img_buf_[best].msg;
+  }
+
+  // ============== extrinsic: lidar -> camera ==============
+  // 你要的：Rcl(9) + t(3)
+  double r_[9]{};
+  double t_[3]{};
+
+  void setDefaultExtrinsic() {
+    r_[0] =  0.017659; r_[1] = -0.999684; r_[2] =  0.017928;
+    r_[3] = -0.029468; r_[4] = -0.018444; r_[5] = -0.999396;
+    r_[6] =  0.999410; r_[7] =  0.017120; r_[8] = -0.029784;
+
+    t_[0] = -0.275539;
+    t_[1] =  0.686930;
+    t_[2] = -0.230909;
+  }
+
+  // 读取 ../config/single_calib_result.txt
+  // 为了兼容未知格式：从文件里“扫出所有 double”，取前 12 个作为 [r0..r8, t0..t2]
+  bool loadExtrinsic(const std::string& path) {
+    std::ifstream ifs(path);
+    if (!ifs.is_open()) {
+      RCLCPP_ERROR(get_logger(), "Cannot open extrinsic file: %s", path.c_str());
+      return false;
+    }
+
+    // 初始化为 NaN，用于检测是否全部读到
+    std::array<double, 9> r_tmp;
+    std::array<double, 3> t_tmp;
+    r_tmp.fill(std::numeric_limits<double>::quiet_NaN());
+    t_tmp.fill(std::numeric_limits<double>::quiet_NaN());
+
+    // 兼容空格/正负号/科学计数法
+    // 匹配形如：r[0] =  0.017659;
+    const std::regex re_r(
+        R"(\br\s*\[\s*([0-8])\s*\]\s*=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*;)");
+    // 匹配形如：t[2] = -0.230909;
+    const std::regex re_t(
+        R"(\bt\s*\[\s*([0-2])\s*\]\s*=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*;)");
+
+    std::string line;
+    while (std::getline(ifs, line)) {
+      // 去掉 // 之后的注释部分，避免 regex 被干扰（虽然这个 regex 本身也能扛，但更稳）
+      auto pos = line.find("//");
+      if (pos != std::string::npos) line = line.substr(0, pos);
+
+      std::smatch m;
+      if (std::regex_search(line, m, re_r)) {
+        int idx = std::stoi(m[1].str());
+        double val = std::stod(m[2].str());
+        r_tmp[idx] = val;
+        continue;
+      }
+      if (std::regex_search(line, m, re_t)) {
+        int idx = std::stoi(m[1].str());
+        double val = std::stod(m[2].str());
+        t_tmp[idx] = val;
+        continue;
+      }
+    }
+
+    // 检查是否读全
+    for (int i = 0; i < 9; ++i) {
+      if (!std::isfinite(r_tmp[i])) {
+        RCLCPP_ERROR(get_logger(), "Extrinsic parse error: missing r[%d] in %s", i, path.c_str());
+        return false;
+      }
+    }
+    for (int i = 0; i < 3; ++i) {
+      if (!std::isfinite(t_tmp[i])) {
+        RCLCPP_ERROR(get_logger(), "Extrinsic parse error: missing t[%d] in %s", i, path.c_str());
+        return false;
+      }
+    }
+
+    // 写入成员变量
+    for (int i = 0; i < 9; ++i) r_[i] = r_tmp[i];
+    for (int i = 0; i < 3; ++i) t_[i] = t_tmp[i];
+
+    RCLCPP_INFO(get_logger(),
+      "Loaded extrinsic (lidar->cam): "
+      "R=[%.6f %.6f %.6f; %.6f %.6f %.6f; %.6f %.6f %.6f], "
+      "t=[%.6f %.6f %.6f]",
+      r_[0], r_[1], r_[2], r_[3], r_[4], r_[5], r_[6], r_[7], r_[8],
+      t_[0], t_[1], t_[2]);
+
+    return true;
+  }
+
+  // ============== camera intrinsics/distortion ==============
+  double fx_{}, fy_{}, cx_{}, cy_{};
+  double k1_{}, k2_{}, p1_{}, p2_{};
+
+  // ============== tf and topics ==============
+  std::string cloud_topic_, image_topic_, lidar_frame_, calib_file_;
+  double tf_timeout_s_{0.2};
+  std::string interp_{"bilinear"};
+
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_cloud_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_img_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_colored_;
+
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
+
+  // ============== image access ==============
+  static bool wrapImage(const sensor_msgs::msg::Image& img, cv::Mat& out, bool& is_rgb) {
+    int type;
+    if (img.encoding == "bgr8") { type = CV_8UC3; is_rgb = false; }
+    else if (img.encoding == "rgb8") { type = CV_8UC3; is_rgb = true; }
+    else if (img.encoding == "mono8") { type = CV_8UC1; is_rgb = false; }
+    else return false;
+
+    cv::Mat wrapped(img.height, img.width, type,
+                    const_cast<unsigned char*>(img.data.data()),
+                    img.step);
+    if (wrapped.empty()) return false;
+
+    out = wrapped; // 注意：不 clone，后面立刻用；若你要跨线程用再 clone
+    return true;
+  }
+
+  inline void sampleColor(const cv::Mat& img, bool is_rgb, float u, float v,
+                          uint8_t& r, uint8_t& g, uint8_t& b) const {
+    const int w = img.cols, h = img.rows;
+
+    if (interp_ == "nearest") {
+      int ui = (int)std::lround(u);
+      int vi = (int)std::lround(v);
+      if (ui < 0 || ui >= w || vi < 0 || vi >= h) { r=g=b=100; return; }
+      if (img.type() == CV_8UC3) {
+        const cv::Vec3b& px = img.at<cv::Vec3b>(vi, ui);
+        if (is_rgb) { r=px[0]; g=px[1]; b=px[2]; }
+        else        { r=px[2]; g=px[1]; b=px[0]; }
+      } else {
+        uint8_t val = img.at<uint8_t>(vi, ui);
+        r=g=b=val;
+      }
+      return;
+    }
+
+    // bilinear
+    int x0 = (int)std::floor(u), y0 = (int)std::floor(v);
+    int x1 = x0 + 1, y1 = y0 + 1;
+    if (x0 < 0 || x1 >= w || y0 < 0 || y1 >= h) { r=g=b=100; return; }
+    float ax = u - x0, ay = v - y0;
+
+    auto lerp = [](float a, float b, float t){ return a + (b-a)*t; };
+
+    if (img.type() == CV_8UC3) {CloudToLidarNode
+      const cv::Vec3b& p00 = img.at<cv::Vec3b>(y0, x0);
+      const cv::Vec3b& p10 = img.at<cv::Vec3b>(y0, x1);
+      const cv::Vec3b& p01 = img.at<cv::Vec3b>(y1, x0);
+      const cv::Vec3b& p11 = img.at<cv::Vec3b>(y1, x1);
+
+      // channel order depends on encoding
+      float c00r,c00g,c00b,c10r,c10g,c10b,c01r,c01g,c01b,c11r,c11g,c11b;
+      if (is_rgb) {
+        c00r=p00[0]; c00g=p00[1]; c00b=p00[2];
+        c10r=p10[0]; c10g=p10[1]; c10b=p10[2];
+        c01r=p01[0]; c01g=p01[1]; c01b=p01[2];
+        c11r=p11[0]; c11g=p11[1]; c11b=p11[2];
+      } else {
+        c00r=p00[2]; c00g=p00[1]; c00b=p00[0];
+        c10r=p10[2]; c10g=p10[1]; c10b=p10[0];
+        c01r=p01[2]; c01g=p01[1]; c01b=p01[0];
+        c11r=p11[2]; c11g=p11[1]; c11b=p11[0];
+      }
+
+      float r0 = lerp(c00r, c10r, ax);
+      float r1 = lerp(c01r, c11r, ax);
+      float g0 = lerp(c00g, c10g, ax);
+      float g1 = lerp(c01g, c11g, ax);
+      float b0 = lerp(c00b, c10b, ax);
+      float b1 = lerp(c01b, c11b, ax);
+
+      r = (uint8_t)std::lround(lerp(r0, r1, ay));
+      g = (uint8_t)std::lround(lerp(g0, g1, ay));
+      b = (uint8_t)std::lround(lerp(b0, b1, ay));
+    } else {
+      float p00 = img.at<uint8_t>(y0, x0);
+      float p10 = img.at<uint8_t>(y0, x1);
+      float p01 = img.at<uint8_t>(y1, x0);
+      float p11 = img.at<uint8_t>(y1, x1);
+
+      float v0 = lerp(p00, p10, ax);
+      float v1 = lerp(p01, p11, ax);
+      uint8_t val = (uint8_t)std::lround(lerp(v0, v1, ay));
+      r=g=b=val;
+    }
+  }
+
+  // ============== main cloud callback ==============
+  void onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    if (msg->header.frame_id.empty()) return;
+
+    // 1) 拿最近图：通常 picture_filter 已经对齐 stamp，这里给一个容忍
+    const rclcpp::Time t_cloud(msg->header.stamp);
+    auto img_msg = getNearestImage(t_cloud, /*max_dt*/ 0.05);
+    if (!img_msg) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "No nearest image for this cloud.");
+      return;
+    }
+
+    cv::Mat img;
+    bool is_rgb = false;
+    if (!wrapImage(*img_msg, img, is_rgb)) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Unsupported image encoding: %s", img_msg->encoding.c_str());
+      return;
+    }
+
+    // 2) TF：把 cloud 从 odom 变到 lidar_frame（确保后续外参 Rcl 对齐 lidar_frame）
+    geometry_msgs::msg::TransformStamped T_odom_to_lidar;
+    try {
+      T_odom_to_lidar = tf_buffer_.lookupTransform(
+        lidar_frame_,                 // target
+        msg->header.frame_id,         // source (odom)
+        msg->header.stamp,
+        rclcpp::Duration::from_seconds(tf_timeout_s_)
+      );
+    } catch (const tf2::TransformException &ex) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "TF lookup failed: %s", ex.what());
+      return;
+    }
+
+    sensor_msgs::msg::PointCloud2 cloud_in_lidar_msg;
+    tf2::doTransform(*msg, cloud_in_lidar_msg, T_odom_to_lidar);
+    cloud_in_lidar_msg.header.frame_id = lidar_frame_;
+
+    // 3) 转 PCL，逐点：lidar -> camera -> project -> sample color
+    pcl::PointCloud<pcl::PointXYZI> cloud_lidar;
+    pcl::fromROSMsg(cloud_in_lidar_msg, cloud_lidar);
+
+    pcl::PointCloud<pcl::PointXYZRGB> cloud_colored;
+    cloud_colored.reserve(cloud_lidar.size());
+
+    const int w = img.cols, h = img.rows;
+
+    for (const auto& pt : cloud_lidar.points) {
+      pcl::PointXYZRGB out;
+      out.x = pt.x; out.y = pt.y; out.z = pt.z;
+      out.r = 100; out.g = 100; out.b = 100;
+
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) {
+        cloud_colored.push_back(out);
+        continue;
+      }
+
+      // lidar -> camera
+      double xc = r_[0]*pt.x + r_[1]*pt.y + r_[2]*pt.z + t_[0];
+      double yc = r_[3]*pt.x + r_[4]*pt.y + r_[5]*pt.z + t_[1];
+      double zc = r_[6]*pt.x + r_[7]*pt.y + r_[8]*pt.z + t_[2];
+
+      // OpenCV 相机系：+Z 前。只投影 z>0 的点
+      if (zc <= 0.1) {
+        cloud_colored.push_back(out);
+        continue;
+      }
+
+      // normalize
+      double invz = 1.0 / zc;
+      double xn = xc * invz;
+      double yn = yc * invz;
+
+      // distortion (Brown-Conrady)
+      double r2 = xn*xn + yn*yn;
+      double r4 = r2*r2;
+      double rad = 1.0 + k1_*r2 + k2_*r4;
+      double x_d = xn * rad + 2.0*p1_*xn*yn + p2_*(r2 + 2.0*xn*xn);
+      double y_d = yn * rad + p1_*(r2 + 2.0*yn*yn) + 2.0*p2_*xn*yn;
+
+      float u = (float)(fx_ * x_d + cx_);
+      float v = (float)(fy_ * y_d + cy_);
+
+      if (u >= 0.0f && u < (float)w && v >= 0.0f && v < (float)h) {
+        uint8_t rr, gg, bb;
+        sampleColor(img, is_rgb, u, v, rr, gg, bb);
+        out.r = rr; out.g = gg; out.b = bb;
+      }
+
+      cloud_colored.push_back(out);
+    }
+
+    // 4) 发布彩色点云（frame 建议设为 lidar_frame 或 camera_frame，这里给 lidar_frame）
+    sensor_msgs::msg::PointCloud2 out_msg;
+    pcl::toROSMsg(cloud_colored, out_msg);
+    out_msg.header.stamp = msg->header.stamp;
+    out_msg.header.frame_id = lidar_frame_;   // 颜色来自相机，但点坐标仍是 lidar系（如果你想坐标也变到相机系，就改成 camera_frame 并把 out.x/y/z 用 xc/yc/zc）
+    pub_colored_->publish(out_msg);
+  }
+};
+
+int main(int argc, char** argv) {
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<CloudToLidarNode>());
+  rclcpp::shutdown();
+  return 0;
+}
