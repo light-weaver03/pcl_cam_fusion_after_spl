@@ -2,10 +2,17 @@ from launch import LaunchDescription
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition
 
 def generate_launch_description():
+    run_lio = LaunchConfiguration("run_lio")
 
+    declare_run_lio = DeclareLaunchArgument(
+        "run_lio", default_value="true",
+        description="Whether to launch small_point_lio and static TF"
+    )
     small_point_lio_node = Node(
         package="small_point_lio",
         executable="small_point_lio_node",
@@ -20,6 +27,7 @@ def generate_launch_description():
                 ]
             )
         ],
+        condition=IfCondition(run_lio),
     )
 
     static_base_link_to_livox_frame = Node(
@@ -43,6 +51,7 @@ def generate_launch_description():
             "--child-frame-id",
             "livox_frame",
         ],
+        condition=IfCondition(run_lio),
         # arguments=[
         #     "--x",
         #     "0.0",
@@ -71,9 +80,8 @@ def generate_launch_description():
         output="screen",
         parameters=[{
             "image_in": "/image_raw",
-            "cloud_in": "/cloud_registered",
             "image_out": "/image_nearest",
-            "max_dt": 0.05,
+            "max_dt": 0.3,
             "buffer_size": 200,
         }],
     )
@@ -84,7 +92,6 @@ def generate_launch_description():
         name="cloud_to_lidar_colorize",
         output="screen",
         parameters=[{
-            "cloud_topic": "/cloud_registered",
             "image_topic": "/image_nearest",
             "lidar_frame": "livox_frame",
             # 用包内 config 路径更稳（不要用 ../ 相对路径）
@@ -94,14 +101,15 @@ def generate_launch_description():
             "interp": "bilinear",
             "tf_timeout": 0.2,
             # 相机内参/畸变（可按需放这里）
-            "fx": 13800.0, "fy": 13800.0,
-            "cx": 743.785, "cy": 566.278,
-            "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0,
+            "fx":  17389.74446324433, "fy": 17137.88266951942,
+            "cx": 1009.440472967610, "cy": 1538.804619553634,
+            "k1": 2.076393990914652, "k2": -149.3987088187306, "p1": 0.0, "p2": 0.0,
         }],
     )
 
 
     return LaunchDescription([
+    	declare_run_lio,
     	small_point_lio_node, 
     	static_base_link_to_livox_frame,
     	picture_filter_node,

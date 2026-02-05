@@ -32,7 +32,7 @@ public:
     tf_listener_(tf_buffer_) {
 
     // ---------------- params ----------------
-    declare_parameter<std::string>("cloud_topic", "/cloud_registered");
+    declare_parameter<std::string>("cloud_topic", "/livox/lidar");
     declare_parameter<std::string>("image_topic", "/image_nearest");   // picture_filter 输出
     declare_parameter<std::string>("lidar_frame", "livox_frame");      // 与 TF 一致
     declare_parameter<std::string>("calib_file", "single_calib_result.txt");
@@ -204,6 +204,7 @@ private:
     return true;
   }
 
+
   // ============== camera intrinsics/distortion ==============
   double fx_{}, fy_{}, cx_{}, cy_{};
   double k1_{}, k2_{}, p1_{}, p2_{};
@@ -327,26 +328,36 @@ private:
     }
 
     // 2) TF：把 cloud 从 odom 变到 lidar_frame（确保后续外参 Rcl 对齐 lidar_frame）
-    geometry_msgs::msg::TransformStamped T_odom_to_lidar;
-    try {
-      T_odom_to_lidar = tf_buffer_.lookupTransform(
-        lidar_frame_,                 // target
-        msg->header.frame_id,         // source (odom)
-        msg->header.stamp,
-        rclcpp::Duration::from_seconds(tf_timeout_s_)
-      );
-    } catch (const tf2::TransformException &ex) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "TF lookup failed: %s", ex.what());
+    // geometry_msgs::msg::TransformStamped T_odom_to_lidar;
+    // try {
+    //   T_odom_to_lidar = tf_buffer_.lookupTransform(
+    //     lidar_frame_,                 // target
+    //     msg->header.frame_id,         // source (odom)
+    //     msg->header.stamp,
+    //     rclcpp::Duration::from_seconds(tf_timeout_s_)
+    //   );
+    // } catch (const tf2::TransformException &ex) {
+    //   RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "TF lookup failed: %s", ex.what());
+    //   return;
+    // }
+
+    // sensor_msgs::msg::PointCloud2 cloud_in_lidar_msg;
+    // tf2::doTransform(*msg, cloud_in_lidar_msg, T_odom_to_lidar);
+    // cloud_in_lidar_msg.header.frame_id = lidar_frame_;
+    
+    // 2) 现在没有 odom/base_link/TF 链路：要求点云本身就是 lidar_frame_ 下的
+    if (!lidar_frame_.empty() && msg->header.frame_id != lidar_frame_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+        "Cloud frame_id (%s) != lidar_frame param (%s). "
+        "Either set lidar_frame to match, or ensure your extrinsic is for this frame.",
+        msg->header.frame_id.c_str(), lidar_frame_.c_str());
       return;
     }
 
-    sensor_msgs::msg::PointCloud2 cloud_in_lidar_msg;
-    tf2::doTransform(*msg, cloud_in_lidar_msg, T_odom_to_lidar);
-    cloud_in_lidar_msg.header.frame_id = lidar_frame_;
 
     // 3) 转 PCL，逐点：lidar -> camera -> project -> sample color
     pcl::PointCloud<pcl::PointXYZI> cloud_lidar;
-    pcl::fromROSMsg(cloud_in_lidar_msg, cloud_lidar);
+    pcl::fromROSMsg(*msg, cloud_lidar);
 
     pcl::PointCloud<pcl::PointXYZRGB> cloud_colored;
     cloud_colored.reserve(cloud_lidar.size());
@@ -413,3 +424,4 @@ int main(int argc, char** argv) {
   rclcpp::shutdown();
   return 0;
 }
+
